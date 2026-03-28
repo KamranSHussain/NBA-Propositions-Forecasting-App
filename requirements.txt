@@ -1,0 +1,16 @@
+# Web App
+streamlit
+
+# NBA Data
+nba_api
+
+# Data Manipulation
+pandas
+numpy
+
+# Machine Learning
+torch
+
+# Visualization (Optional, but great for Streamlit)
+plotly
+matplotlib
