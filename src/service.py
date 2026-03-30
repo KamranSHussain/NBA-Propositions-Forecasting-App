@@ -9,6 +9,7 @@ This module is designed for app workflows where a user:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
@@ -25,10 +26,13 @@ from src.model import DEFAULT_QUANTILES, PinballLoss, PlayerPropNN
 
 TARGET_COLUMN = "PTS"
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_EPOCHS = 75
+DEFAULT_MAX_EPOCHS = 200
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-5
 DEFAULT_ROSTER_CAP = 18
+DEFAULT_EARLY_STOPPING_PATIENCE = 12
+DEFAULT_EARLY_STOPPING_MIN_DELTA = 1e-4
+DEFAULT_VALIDATION_FRACTION = 0.15
 
 ID_COLUMNS: tuple[str, ...] = (
     "GAME_ID",
@@ -56,7 +60,9 @@ class ModelArtifacts:
     train_end_date: pd.Timestamp
     train_rows: int
     test_rows: int
+    epochs_trained: int
     train_loss: float
+    val_loss: float
     test_loss: float
     feature_mean: pd.Series
     feature_std: pd.Series
@@ -121,19 +127,48 @@ def _to_tensor(values: np.ndarray) -> torch.Tensor:
     return torch.tensor(values.astype(np.float32), dtype=torch.float32)
 
 
+def _split_train_validation(
+    train_df: pd.DataFrame,
+    val_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Create temporal train/validation subsets for early stopping."""
+    if not 0.0 < val_fraction < 0.5:
+        raise ValueError("val_fraction must be between 0 and 0.5.")
+
+    ordered = train_df.sort_values("GAME_DATE").reset_index(drop=True)
+    val_size = max(1, int(len(ordered) * val_fraction))
+    split_idx = len(ordered) - val_size
+
+    if split_idx < 1:
+        raise ValueError("Not enough train rows for validation split. Increase date range.")
+
+    fit_df = ordered.iloc[:split_idx].copy()
+    val_df = ordered.iloc[split_idx:].copy()
+    return fit_df.reset_index(drop=True), val_df.reset_index(drop=True)
+
+
 def train_model(
     df: pd.DataFrame,
     split_date: str | date | datetime | pd.Timestamp,
-    epochs: int = DEFAULT_EPOCHS,
+    max_epochs: int = DEFAULT_MAX_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
+    early_stopping_min_delta: float = DEFAULT_EARLY_STOPPING_MIN_DELTA,
+    val_fraction: float = DEFAULT_VALIDATION_FRACTION,
     quantiles: tuple[float, ...] = DEFAULT_QUANTILES,
     random_seed: int = 42,
 ) -> ModelArtifacts:
-    """Train quantile regression model using a date-based train/test split."""
+    """Train quantile model with temporal validation early stopping."""
     if TARGET_COLUMN not in df.columns:
         raise ValueError(f"Expected target column '{TARGET_COLUMN}' in training dataframe.")
+    if max_epochs < 1:
+        raise ValueError("max_epochs must be >= 1.")
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be >= 1.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0.")
 
     split_ts = _to_timestamp(split_date)
     torch.manual_seed(random_seed)
@@ -141,23 +176,34 @@ def train_model(
 
     feature_cols = feature_columns_from_frame(df)
     train_df, test_df = _split_train_test(df=df, split_date=split_ts)
+    fit_df, val_df = _split_train_validation(train_df=train_df, val_fraction=val_fraction)
 
-    train_x = train_df[feature_cols].copy()
+    train_x = fit_df[feature_cols].copy()
+    val_x = val_df[feature_cols].copy()
     test_x = test_df[feature_cols].copy()
-    train_x, test_x, feature_mean, feature_std = _standardize_train_test(train_x=train_x, test_x=test_x)
+    train_x, val_x, feature_mean, feature_std = _standardize_train_test(train_x=train_x, test_x=val_x)
+    test_x = (test_x - feature_mean) / feature_std
 
-    train_y = train_df[[TARGET_COLUMN]].to_numpy()
+    train_y = fit_df[[TARGET_COLUMN]].to_numpy()
+    val_y = val_df[[TARGET_COLUMN]].to_numpy()
     test_y = test_df[[TARGET_COLUMN]].to_numpy()
 
     train_ds = TensorDataset(_to_tensor(train_x.to_numpy()), _to_tensor(train_y))
+    val_x_tensor = _to_tensor(val_x.to_numpy())
+    val_y_tensor = _to_tensor(val_y)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     model = PlayerPropNN(input_size=len(feature_cols))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = PinballLoss(quantiles=quantiles)
 
-    model.train()
-    for _ in range(epochs):
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
         for batch_x, batch_y in train_loader:
             optimizer.zero_grad()
             preds = model(batch_x)
@@ -165,11 +211,29 @@ def train_model(
             loss.backward()
             optimizer.step()
 
+        model.eval()
+        with torch.no_grad():
+            current_val_loss = float(criterion(model(val_x_tensor), val_y_tensor).item())
+
+        if current_val_loss < (best_val_loss - early_stopping_min_delta):
+            best_val_loss = current_val_loss
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            best_state_dict = copy.deepcopy(model.state_dict())
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stopping_patience:
+                break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
     model.eval()
     with torch.no_grad():
         train_loss = float(
             criterion(model(_to_tensor(train_x.to_numpy())), _to_tensor(train_y)).item()
         )
+        val_loss = float(criterion(model(val_x_tensor), val_y_tensor).item())
         test_loss = float(
             criterion(model(_to_tensor(test_x.to_numpy())), _to_tensor(test_y)).item()
         )
@@ -181,7 +245,9 @@ def train_model(
         train_end_date=split_ts,
         train_rows=len(train_df),
         test_rows=len(test_df),
+        epochs_trained=best_epoch if best_epoch > 0 else max_epochs,
         train_loss=train_loss,
+        val_loss=val_loss,
         test_loss=test_loss,
         feature_mean=feature_mean,
         feature_std=feature_std,
@@ -409,7 +475,9 @@ def model_summary(artifacts: ModelArtifacts) -> dict[str, Any]:
         "train_end_date": str(artifacts.train_end_date.date()),
         "train_rows": artifacts.train_rows,
         "test_rows": artifacts.test_rows,
+        "epochs_trained": artifacts.epochs_trained,
         "train_loss": round(artifacts.train_loss, 6),
+        "val_loss": round(artifacts.val_loss, 6),
         "test_loss": round(artifacts.test_loss, 6),
         "feature_count": len(artifacts.feature_columns),
         "quantiles": list(artifacts.quantiles),

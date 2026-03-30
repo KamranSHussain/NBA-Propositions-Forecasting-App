@@ -1,6 +1,6 @@
-# NBA Player Proposition Predictor
+# NBA Player Proposition Forecasting App
 
-An end-to-end NBA player-prop forecasting project with a production-style Streamlit interface.
+An NBA player-prop forecasting project with a production-style Streamlit interface.
 
 This repository walks through the full workflow of:
 1. Pulling real NBA data from `nba_api`.
@@ -183,7 +183,7 @@ State behavior:
 
 ```bash
 git clone <your-repo-url>
-cd NBA-Player-Proposition-Predictor
+cd NBA-Prop-Forecasting-App
 ```
 
 ### 2. Create Virtual Environment
@@ -191,15 +191,15 @@ cd NBA-Player-Proposition-Predictor
 macOS/Linux:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv env
+source env/bin/activate
 ```
 
 Windows (PowerShell):
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+python -m venv env
+.\env\Scripts\Activate.ps1
 ```
 
 ### 3. Install Dependencies
@@ -227,7 +227,8 @@ train_df, current_players, current_teams = get_nba_data(start_year=2018, end_yea
 artifacts = train_model(
 	 df=train_df,
 	 split_date="2024-01-15",
-	 epochs=75,
+	 max_epochs=200,
+	 early_stopping_patience=12,
 	 batch_size=256,
 	 learning_rate=1e-3,
 )
@@ -261,17 +262,15 @@ print(predictions.head())
 ## Repository Structure
 
 ```text
-NBA-Player-Proposition-Predictor/
+NBA-Proposition-Forecasting-App/
 |- app.py                    # Streamlit dashboard
-|- data_preprocessing.py     # Compatibility wrapper (re-exports from src.data)
 |- requirements.txt          # Python dependencies
+|- LICENSE
+|- README.md
 |- src/
 |  |- data.py                # Data ingestion + feature engineering
 |  |- model.py               # Quantile model + pinball loss
 |  |- service.py             # Train/eval/predict service layer
-|- nba_data.ipynb            # Notebook experimentation
-|- LICENSE
-|- README.md
 ```
 
 ## Metrics and Interpretation Notes

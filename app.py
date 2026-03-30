@@ -280,7 +280,8 @@ with left:
     )
 with right:
     with st.expander("Training Params", expanded=False):
-        epochs = st.slider("Epochs", min_value=10, max_value=200, value=75, step=5)
+        max_epochs = st.slider("Max Epochs", min_value=25, max_value=300, value=200, step=25)
+        early_stopping_patience = st.slider("Early Stopping Patience", min_value=3, max_value=30, value=12, step=1)
         batch_size = st.selectbox("Batch Size", options=[64, 128, 256, 512], index=2)
         learning_rate = st.selectbox("Learning Rate", options=[1e-4, 5e-4, 1e-3, 2e-3], index=2)
 
@@ -290,7 +291,8 @@ if st.button("Train", type="primary"):
             artifacts = train_model(
                 df=train_df,
                 split_date=split_date,
-                epochs=int(epochs),
+                max_epochs=int(max_epochs),
+                early_stopping_patience=int(early_stopping_patience),
                 batch_size=int(batch_size),
                 learning_rate=float(learning_rate),
             )
