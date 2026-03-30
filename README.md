@@ -1,6 +1,6 @@
 # NBA Player Proposition Predictor
 
-An end-to-end NBA player-prop forecasting project with a production-style Streamlit interface.
+A NBA player-prop forecasting project with a production-style Streamlit interface.
 
 This repository walks through the full workflow of:
 1. Pulling real NBA data from `nba_api`.
