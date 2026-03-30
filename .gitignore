@@ -1,5 +1,4 @@
 nba_data.ipynb
-
-venv/
-
+.DS_Store
 src/__pycache__/
+venv/
