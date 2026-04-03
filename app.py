@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-import pandas as pd
-import streamlit as st
+from datetime import date
+from pathlib import Path
 
-from src.data import DEFAULT_END_YEAR, DEFAULT_START_YEAR, get_nba_data
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import torch
+
+from src.data import get_nba_data
 from src.service import (
     evaluate_test_set,
     get_matchup_rosters,
+    model_summary,
     predict_matchup,
     team_lookup,
-    train_model,
 )
 
 st.set_page_config(page_title="NBA Player Prop Predictor", layout="wide")
@@ -153,16 +159,41 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.caption("Train by date split, then predict player quantiles for a selected matchup.")
+st.caption("Data and model load automatically, so you can jump straight to matchup quantile predictions.")
 
-MIN_DATA_YEAR = 2010
-MAX_DATA_YEAR = 2026
+DATA_START_YEAR = 2020
+TRAIN_TEST_SPLIT_DATE = pd.Timestamp("2024-06-18")
+MODEL_ARTIFACT_PATH = Path("models/player_prop_artifacts.pt")
 
 
-@st.cache_data(show_spinner=False)
-def load_datasets(start_year: int, end_year: int):
-    """Load and cache processed training + inference datasets."""
-    return get_nba_data(start_year=start_year, end_year=end_year)
+def _rolling_end_year_exclusive(today: date | None = None) -> int:
+    """Return end_year (exclusive) so current season is included automatically."""
+    today = today or date.today()
+    return today.year + (1 if today.month >= 9 else 0)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_datasets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+    """Load and cache rolling processed datasets from 2020 to present."""
+    end_year = _rolling_end_year_exclusive()
+    train_df, current_players, current_teams = get_nba_data(start_year=DATA_START_YEAR, end_year=end_year)
+    return train_df, current_players, current_teams, end_year
+
+
+@st.cache_resource(show_spinner=False)
+def load_pretrained_artifacts(artifact_path: str):
+    """Load pre-trained model artifacts from disk."""
+    path = Path(artifact_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing model artifact at '{path}'. Run scripts/train_artifact.py to generate it."
+        )
+    try:
+        # Artifact files are generated locally by this project and include Python objects.
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Backward compatibility for older torch versions without weights_only.
+        return torch.load(path, map_location="cpu")
 
 
 def _team_label(row: pd.Series) -> str:
@@ -195,7 +226,10 @@ def _ensure_state_defaults() -> None:
     st.session_state.setdefault("current_players", None)
     st.session_state.setdefault("current_teams", None)
     st.session_state.setdefault("artifacts", None)
+    st.session_state.setdefault("data_end_year", None)
+    st.session_state.setdefault("init_error", None)
     st.session_state.setdefault("test_eval", None)
+    st.session_state.setdefault("test_eval_error", None)
     st.session_state.setdefault("latest_predictions", None)
     st.session_state.setdefault("last_matchup_key", None)
 
@@ -203,54 +237,55 @@ def _ensure_state_defaults() -> None:
 _ensure_state_defaults()
 
 with st.sidebar:
-    st.header("Data")
-    start_year = st.number_input(
-        "Start Year",
-        min_value=MIN_DATA_YEAR,
-        max_value=MAX_DATA_YEAR - 1,
-        value=max(MIN_DATA_YEAR, min(DEFAULT_START_YEAR, MAX_DATA_YEAR - 1)),
-        step=1,
-    )
-    end_year = st.number_input(
-        "End Year (exclusive)",
-        min_value=int(start_year) + 1,
-        max_value=MAX_DATA_YEAR,
-        value=min(MAX_DATA_YEAR, max(int(start_year) + 1, DEFAULT_END_YEAR)),
-        step=1,
-    )
+    st.header("Setup")
+    st.caption("Data and model are prepared automatically.")
+    st.caption(f"Data window: {DATA_START_YEAR} to present")
+    st.caption(f"Fixed split date: {TRAIN_TEST_SPLIT_DATE.date()}")
 
-    if int(end_year) <= int(start_year):
-        st.error("End year must be greater than start year.")
+if not st.session_state.data_loaded or st.session_state.artifacts is None:
+    try:
+        with st.spinner("Loading data and model artifacts..."):
+            train_df, current_players, current_teams, data_end_year = load_datasets()
+            artifacts = load_pretrained_artifacts(str(MODEL_ARTIFACT_PATH))
 
-    if st.button("Load Data", type="primary"):
-        if int(end_year) <= int(start_year):
-            st.error("Fix year range before loading data.")
-        else:
-            try:
-                with st.spinner("Fetching and processing NBA data..."):
-                    train_df, current_players, current_teams = load_datasets(
-                        start_year=int(start_year),
-                        end_year=int(end_year),
-                    )
-                st.session_state.train_df = train_df
-                st.session_state.current_players = current_players
-                st.session_state.current_teams = current_teams
-                st.session_state.artifacts = None
-                st.session_state.test_eval = None
-                st.session_state.latest_predictions = None
-                st.session_state.last_matchup_key = None
-                st.session_state.data_loaded = True
-                st.success("Data loaded.")
-            except Exception as exc:
-                st.error(f"Data load failed: {exc}")
+        st.session_state.train_df = train_df
+        st.session_state.current_players = current_players
+        st.session_state.current_teams = current_teams
+        st.session_state.artifacts = artifacts
+        st.session_state.data_end_year = int(data_end_year)
+        st.session_state.latest_predictions = None
+        st.session_state.last_matchup_key = None
+        st.session_state.data_loaded = True
+        st.session_state.init_error = None
+
+        try:
+            st.session_state.test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)
+            st.session_state.test_eval_error = None
+        except Exception as eval_exc:
+            st.session_state.test_eval = None
+            st.session_state.test_eval_error = str(eval_exc)
+    except Exception as exc:
+        st.session_state.init_error = str(exc)
+        st.session_state.data_loaded = False
 
 if not st.session_state.data_loaded:
-    st.info("Load data from the sidebar to begin training.")
+    st.error(
+        f"Startup initialization failed: {st.session_state.init_error}"
+    )
+    st.info("Generate the artifact with: python scripts/train_artifact.py")
     st.stop()
 
 train_df: pd.DataFrame = st.session_state.train_df
 current_players: pd.DataFrame = st.session_state.current_players
 current_teams: pd.DataFrame = st.session_state.current_teams
+artifacts = st.session_state.artifacts
+
+if st.session_state.test_eval is None and st.session_state.test_eval_error is None:
+    try:
+        with st.spinner("Computing test diagnostics..."):
+            st.session_state.test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)
+    except Exception as eval_exc:
+        st.session_state.test_eval_error = str(eval_exc)
 
 col_a, col_b, col_c = st.columns(3)
 col_a.metric("Training Rows", f"{len(train_df):,}")
@@ -258,55 +293,31 @@ col_b.metric("Current Players", f"{len(current_players):,}")
 col_c.metric("Current Teams", f"{len(current_teams):,}")
 
 st.divider()
-st.subheader("1. Train Model")
+st.subheader("Model Setup")
+summary = model_summary(artifacts)
+info_1, info_2, info_3 = st.columns(3)
+info_1.metric("Artifact Split Date", summary["train_end_date"])
+info_2.metric("Artifact Train Rows", f"{int(summary['train_rows']):,}")
+info_3.metric("Artifact Test Rows", f"{int(summary['test_rows']):,}")
 
-sorted_dates = pd.to_datetime(train_df["GAME_DATE"]).sort_values().reset_index(drop=True)
-if len(sorted_dates) < 2:
-    st.error("Not enough rows to create a train/test split.")
-    st.stop()
+st.caption(
+    f"Data seasons fetched: {DATA_START_YEAR}-{st.session_state.data_end_year - 1} | "
+    f"Artifact split date: {TRAIN_TEST_SPLIT_DATE.date()}"
+)
 
-left, right = st.columns([2, 1])
-with left:
-    train_split_pct = st.slider("Train Split (%)", min_value=10, max_value=90, value=75, step=1)
-
-    split_idx = int(len(sorted_dates) * (train_split_pct / 100.0)) - 1
-    split_idx = max(0, min(len(sorted_dates) - 2, split_idx))
-    split_date = pd.Timestamp(sorted_dates.iloc[split_idx]).date()
-
-    est_train_rows = int((pd.to_datetime(train_df["GAME_DATE"]) <= pd.Timestamp(split_date)).sum())
-    est_test_rows = int((pd.to_datetime(train_df["GAME_DATE"]) > pd.Timestamp(split_date)).sum())
-    st.caption(
-        f"Split date: {split_date} | Train rows: {est_train_rows:,} | Test rows: {est_test_rows:,}"
+if summary["train_end_date"] != str(TRAIN_TEST_SPLIT_DATE.date()):
+    st.warning(
+        "Loaded artifact was trained with a different split date. "
+        f"Expected {TRAIN_TEST_SPLIT_DATE.date()}, got {summary['train_end_date']}."
     )
-with right:
-    with st.expander("Training Params", expanded=False):
-        max_epochs = st.slider("Max Epochs", min_value=25, max_value=300, value=200, step=25)
-        early_stopping_patience = st.slider("Early Stopping Patience", min_value=3, max_value=30, value=12, step=1)
-        batch_size = st.selectbox("Batch Size", options=[64, 128, 256, 512], index=2)
-        learning_rate = st.selectbox("Learning Rate", options=[1e-4, 5e-4, 1e-3, 2e-3], index=2)
 
-if st.button("Train", type="primary"):
-    try:
-        with st.spinner("Training quantile model..."):
-            artifacts = train_model(
-                df=train_df,
-                split_date=split_date,
-                max_epochs=int(max_epochs),
-                early_stopping_patience=int(early_stopping_patience),
-                batch_size=int(batch_size),
-                learning_rate=float(learning_rate),
-            )
-            test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)
-        st.session_state.artifacts = artifacts
-        st.session_state.test_eval = test_eval
-        st.success("Training complete.")
-    except Exception as exc:
-        st.session_state.artifacts = None
-        st.session_state.test_eval = None
-        st.error(f"Training failed: {exc}")
+st.divider()
+st.subheader("Model Evaluation Diagnostics")
+
+if st.session_state.test_eval_error:
+    st.warning(f"Could not compute test diagnostics: {st.session_state.test_eval_error}")
 
 if st.session_state.test_eval is not None:
-    st.subheader("Test Set Evaluation")
     test_eval = st.session_state.test_eval
 
     m1, m2, m3 = st.columns(3)
@@ -319,39 +330,59 @@ if st.session_state.test_eval is not None:
     m5.metric("Avg Width (q10-q90)", f"{test_eval.summary['interval_width_q10_q90']:.3f}")
     m6.metric("Coverage (q10-q90)", f"{test_eval.summary['interval_coverage_q10_q90']:.3f}")
 
-    st.markdown("#### Quantile Diagnostics")
-    st.dataframe(test_eval.quantile_metrics, use_container_width=True, hide_index=True)
+    st.markdown("#### Empirical Coverage Calibration")
+    calibration_df = test_eval.quantile_metrics[["nominal_quantile", "empirical_coverage"]].copy()
+    calibration_df = calibration_df.sort_values("nominal_quantile").reset_index(drop=True)
 
-    if {"actual", "q50"}.issubset(test_eval.predictions.columns):
-        chart_df = test_eval.predictions[["actual", "q50"]].copy().head(2000)
-        chart_df["actual"] = pd.to_numeric(chart_df["actual"], errors="coerce")
-        chart_df["q50"] = pd.to_numeric(chart_df["q50"], errors="coerce")
-        chart_df = chart_df.dropna(subset=["actual", "q50"]).reset_index(drop=True)
+    fig_calibration = go.Figure()
+    fig_calibration.add_trace(
+        go.Scatter(
+            x=calibration_df["nominal_quantile"],
+            y=calibration_df["empirical_coverage"],
+            mode="lines+markers",
+            name="Empirical",
+        )
+    )
+    fig_calibration.add_trace(
+        go.Scatter(
+            x=calibration_df["nominal_quantile"],
+            y=calibration_df["nominal_quantile"],
+            mode="lines",
+            name="Ideal",
+            line={"dash": "dash"},
+        )
+    )
+    fig_calibration.update_layout(
+        xaxis_title="Nominal quantile",
+        yaxis_title="Empirical coverage",
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+    )
+    st.plotly_chart(fig_calibration, use_container_width=True)
 
-        st.markdown("#### Actual vs q50 (sample)")
-        st.line_chart(chart_df, y=["actual", "q50"])
+    st.markdown("#### Interval Width vs Total Games In Dataset")
+    player_profile = test_eval.player_interval_profile.copy()
+    if not player_profile.empty:
+        fig_profile = px.scatter(
+            player_profile,
+            x="total_games_in_dataset",
+            y="mean_interval_width_q10_q90",
+            hover_data=["PLAYER_NAME", "outlier_rate", "test_rows"],
+            labels={
+                "total_games_in_dataset": "Total games in dataset",
+                "mean_interval_width_q10_q90": "Mean interval width (q10-q90)",
+            },
+        )
+        fig_profile.update_traces(marker={"size": 10, "opacity": 0.7})
+        fig_profile.update_layout(margin={"l": 10, "r": 10, "t": 30, "b": 10})
+        st.plotly_chart(fig_profile, use_container_width=True)
+    else:
+        st.info("Player interval profile is unavailable.")
 
-    with st.expander("Show Test Predictions Sample", expanded=False):
-        sample_df = test_eval.predictions.copy()
-        team_name_map = _build_team_name_map(current_teams)
-        sample_df["team_name"] = sample_df["TEAM_ID"].map(team_name_map).fillna("Unknown Team")
-
-        quantile_cols = [col for col in sample_df.columns if col.startswith("q")]
-        display_cols = ["GAME_DATE", "PLAYER_NAME", "team_name", "actual", *quantile_cols]
-        display_cols = [col for col in display_cols if col in sample_df.columns]
-        sample_df = sample_df[display_cols].copy()
-
-        n_rows = min(200, len(sample_df))
-        if n_rows > 0:
-            sample_df = sample_df.sample(n=n_rows, random_state=42).sort_values(by="GAME_DATE")
-        st.dataframe(sample_df, use_container_width=True, hide_index=True)
+    st.markdown("#### Performance by Player Data Volume")
+    st.dataframe(test_eval.games_bucket_metrics, use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("2. Predict Matchup")
-
-if st.session_state.artifacts is None:
-    st.warning("Train the model first to enable matchup predictions.")
-    st.stop()
+st.subheader("Predict Matchup")
 
 teams_df = team_lookup(current_teams)
 if teams_df.empty:
@@ -411,7 +442,7 @@ if st.button("Calculate Predictions", type="primary"):
     try:
         with st.spinner("Calculating player predictions..."):
             output = predict_matchup(
-                artifacts=st.session_state.artifacts,
+                artifacts=artifacts,
                 current_players=current_players,
                 current_teams=current_teams,
                 home_team_id=home_team_id,

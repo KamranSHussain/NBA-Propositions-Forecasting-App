@@ -16,9 +16,10 @@ import numpy as np
 import pandas as pd
 from nba_api.stats.endpoints import leaguegamelog
 
-DEFAULT_START_YEAR = 2015
+DEFAULT_START_YEAR = 2020
 DEFAULT_END_YEAR = 2026
 ROLLING_WINDOWS: tuple[int, ...] = (5, 10)
+MIN_MODEL_DATE = pd.Timestamp("2020-01-01")
 
 PLAYER_STATS_TO_ROLL: tuple[str, ...] = (
     "PTS",
@@ -218,14 +219,10 @@ def get_nba_data(
 
     df = _add_player_rolling_features(df=df, windows=ROLLING_WINDOWS)
 
-    current_players = df.groupby("PLAYER_ID").tail(1).copy()
-
     rolling_cols_player = [col for col in df.columns if "Rolling_" in col]
     df[rolling_cols_player] = df.groupby("PLAYER_ID")[rolling_cols_player].shift(1)
 
     matchups = _build_team_matchups(teams_raw=teams_raw, windows=ROLLING_WINDOWS)
-    current_teams = matchups.groupby("TEAM_ID").tail(1).copy()
-
     rolling_cols_team = [
         col
         for col in matchups.columns
@@ -252,6 +249,16 @@ def get_nba_data(
         *TEAM_INFERENCE_COLS,
     ]
 
+    final_df = final_df[columns_of_interest].copy()
+    final_df = final_df[final_df["GAME_DATE"] >= MIN_MODEL_DATE].copy()
+
+    final_df = final_df.dropna(
+        subset=["Rolling_5G_PTS", "Opp_Rolling_5G_opponentScore"]
+    ).reset_index(drop=True)
+
+    current_players = df[df["GAME_DATE"] >= MIN_MODEL_DATE].groupby("PLAYER_ID").tail(1).copy()
+    current_teams = matchups[matchups["GAME_DATE"] >= MIN_MODEL_DATE].groupby("TEAM_ID").tail(1).copy()
+
     player_context_cols = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "days_of_rest", *PLAYER_INFERENCE_COLS]
     current_players = current_players[player_context_cols].copy()
 
@@ -260,12 +267,6 @@ def get_nba_data(
         if optional_col in current_teams.columns:
             team_meta_cols.append(optional_col)
     current_teams = current_teams[[*team_meta_cols, *TEAM_INFERENCE_COLS]].copy()
-
-    final_df = final_df[columns_of_interest].copy()
-
-    final_df = final_df.dropna(
-        subset=["Rolling_5G_PTS", "Opp_Rolling_5G_opponentScore"]
-    ).reset_index(drop=True)
 
     return final_df, current_players.reset_index(drop=True), current_teams.reset_index(drop=True)
 

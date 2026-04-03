@@ -36,6 +36,8 @@ class PinballLoss(nn.Module):
 class PlayerPropNN(nn.Module):
     """Feedforward network that predicts floor/median/ceiling outcomes."""
 
+    #Look into: transformer, set transformer
+
     def __init__(self, input_size: int = 33) -> None:
         super().__init__()
         self.network = nn.Sequential(

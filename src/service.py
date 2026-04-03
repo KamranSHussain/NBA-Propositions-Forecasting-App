@@ -75,6 +75,9 @@ class TestSetEvaluation:
     summary: dict[str, float]
     quantile_metrics: pd.DataFrame
     predictions: pd.DataFrame
+    player_interval_profile: pd.DataFrame
+    games_bucket_metrics: pd.DataFrame
+    outlier_summary: dict[str, float]
 
 
 def _to_timestamp(split_date: str | date | datetime | pd.Timestamp) -> pd.Timestamp:
@@ -492,6 +495,12 @@ def _pinball_loss_numpy(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> flo
 
 def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEvaluation:
     """Evaluate trained artifacts on the date-split test set."""
+    full_df = df.copy()
+    full_df["GAME_DATE"] = pd.to_datetime(full_df["GAME_DATE"])
+    total_games_by_player = (
+        full_df.groupby("PLAYER_ID")["GAME_ID"].nunique().astype(float)
+    )
+
     _, test_df = _split_train_test(df=df, split_date=artifacts.train_end_date)
 
     feature_df = test_df[artifacts.feature_columns].copy()
@@ -522,6 +531,8 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
 
     interval_width = float("nan")
     interval_coverage = float("nan")
+    q10 = np.full_like(y_true, np.nan, dtype=float)
+    q90 = np.full_like(y_true, np.nan, dtype=float)
     try:
         q10_idx = artifacts.quantiles.index(0.10)
         q90_idx = artifacts.quantiles.index(0.90)
@@ -542,16 +553,135 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
         "interval_coverage_q10_q90": interval_coverage,
     }
 
+    for idx, q in enumerate(artifacts.quantiles):
+        y_q = preds[:, idx]
+        q_label = f"q{int(q * 100)}"
+        mae_q = float(np.mean(np.abs(y_true - y_q)))
+        rmse_q = float(np.sqrt(np.mean((y_true - y_q) ** 2)))
+        r2_q = float(1.0 - (np.mean((y_true - y_q) ** 2) / y_var)) if y_var > 0 else float("nan")
+        summary[f"mae_{q_label}"] = mae_q
+        summary[f"rmse_{q_label}"] = rmse_q
+        summary[f"r2_{q_label}"] = r2_q
+
     pred_cols = [f"q{int(q * 100)}" for q in artifacts.quantiles]
-    predictions = test_df[["GAME_DATE", "PLAYER_NAME", "TEAM_ID", TARGET_COLUMN]].copy()
+    predictions = test_df[["GAME_DATE", "PLAYER_ID", "PLAYER_NAME", "TEAM_ID", TARGET_COLUMN]].copy()
     predictions = predictions.rename(columns={TARGET_COLUMN: "actual"})
     for idx, col in enumerate(pred_cols):
         predictions[col] = preds[:, idx]
+
+    predictions["residual_q50"] = predictions["actual"] - y_median
+    predictions["abs_error_q50"] = predictions["residual_q50"].abs()
+    predictions["interval_width_q10_q90"] = q90 - q10
+    predictions["within_interval_q10_q90"] = (
+        (predictions["actual"] >= q10) & (predictions["actual"] <= q90)
+    )
+    predictions["total_games_in_dataset"] = (
+        predictions["PLAYER_ID"].map(total_games_by_player).fillna(0).astype(float)
+    )
+
+    # IQR-based residual outlier detection is robust to skewed error distributions.
+    residual_q1 = float(predictions["residual_q50"].quantile(0.25))
+    residual_q3 = float(predictions["residual_q50"].quantile(0.75))
+    residual_iqr = residual_q3 - residual_q1
+    lower_bound = residual_q1 - (1.5 * residual_iqr)
+    upper_bound = residual_q3 + (1.5 * residual_iqr)
+    predictions["is_outlier"] = (
+        (predictions["residual_q50"] < lower_bound) | (predictions["residual_q50"] > upper_bound)
+    )
+
+    outlier_mask = predictions["is_outlier"]
+    non_outlier_mask = ~outlier_mask
+
+    outlier_summary = {
+        "outlier_count": float(outlier_mask.sum()),
+        "outlier_rate": float(outlier_mask.mean()) if len(predictions) > 0 else float("nan"),
+        "iqr_lower_bound": lower_bound,
+        "iqr_upper_bound": upper_bound,
+        "outlier_mae_q50": float(predictions.loc[outlier_mask, "abs_error_q50"].mean())
+        if outlier_mask.any()
+        else float("nan"),
+        "outlier_rmse_q50": float(np.sqrt(np.mean(predictions.loc[outlier_mask, "residual_q50"] ** 2)))
+        if outlier_mask.any()
+        else float("nan"),
+        "non_outlier_mae_q50": float(predictions.loc[non_outlier_mask, "abs_error_q50"].mean())
+        if non_outlier_mask.any()
+        else float("nan"),
+        "non_outlier_rmse_q50": float(
+            np.sqrt(np.mean(predictions.loc[non_outlier_mask, "residual_q50"] ** 2))
+        )
+        if non_outlier_mask.any()
+        else float("nan"),
+    }
+
+    player_interval_profile = (
+        predictions.groupby(["PLAYER_ID", "PLAYER_NAME"], as_index=False)
+        .agg(
+            total_games_in_dataset=("total_games_in_dataset", "max"),
+            test_rows=("PLAYER_ID", "size"),
+            mean_interval_width_q10_q90=("interval_width_q10_q90", "mean"),
+            mean_abs_error_q50=("abs_error_q50", "mean"),
+            outlier_rate=("is_outlier", "mean"),
+        )
+        .sort_values(by=["total_games_in_dataset", "mean_interval_width_q10_q90"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    bins = [-np.inf, 25, 100, np.inf]
+    labels = ["few_games_1_25", "mid_games_26_100", "many_games_101_plus"]
+    predictions["games_bucket"] = pd.cut(
+        predictions["total_games_in_dataset"], bins=bins, labels=labels
+    )
+
+    bucket_rows: list[dict[str, float | str]] = []
+    for bucket_label in labels:
+        bucket_df = predictions[predictions["games_bucket"] == bucket_label].copy()
+        if bucket_df.empty:
+            bucket_rows.append(
+                {
+                    "games_bucket": bucket_label,
+                    "rows": 0.0,
+                    "players": 0.0,
+                    "mae_q50": float("nan"),
+                    "rmse_q50": float("nan"),
+                    "r2_q50": float("nan"),
+                    "interval_coverage_q10_q90": float("nan"),
+                    "avg_interval_width_q10_q90": float("nan"),
+                }
+            )
+            continue
+
+        y_bucket = bucket_df["actual"].to_numpy(dtype=float)
+        y_bucket_pred = bucket_df["q50"].to_numpy(dtype=float)
+        mse_bucket = float(np.mean((y_bucket - y_bucket_pred) ** 2))
+        var_bucket = float(np.var(y_bucket))
+        bucket_rows.append(
+            {
+                "games_bucket": bucket_label,
+                "rows": float(len(bucket_df)),
+                "players": float(bucket_df["PLAYER_ID"].nunique()),
+                "mae_q50": float(np.mean(np.abs(y_bucket - y_bucket_pred))),
+                "rmse_q50": float(np.sqrt(mse_bucket)),
+                "r2_q50": float(1.0 - (mse_bucket / var_bucket)) if var_bucket > 0 else float("nan"),
+                "interval_coverage_q10_q90": float(bucket_df["within_interval_q10_q90"].mean()),
+                "avg_interval_width_q10_q90": float(bucket_df["interval_width_q10_q90"].mean()),
+            }
+        )
+
+    games_bucket_metrics = pd.DataFrame(bucket_rows)
+
+    quantile_metrics = quantile_metrics.copy()
+    quantile_metrics["nominal_quantile"] = quantile_metrics["quantile"]
+    quantile_metrics["calibration_gap"] = (
+        quantile_metrics["empirical_coverage"] - quantile_metrics["nominal_quantile"]
+    )
 
     return TestSetEvaluation(
         summary=summary,
         quantile_metrics=quantile_metrics,
         predictions=predictions.reset_index(drop=True),
+        player_interval_profile=player_interval_profile,
+        games_bucket_metrics=games_bucket_metrics,
+        outlier_summary=outlier_summary,
     )
 
 

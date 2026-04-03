@@ -5,9 +5,9 @@ A NBA player-prop forecasting project with a production-style Streamlit interfac
 This repository walks through the full workflow of:
 1. Pulling real NBA data from `nba_api`.
 2. Building leakage-safe rolling player and team features.
-3. Training a PyTorch quantile-regression model.
+3. Training a PyTorch quantile-regression model offline.
 4. Evaluating out-of-sample performance.
-5. Producing matchup-specific player projections (`q10`, `q50`, `q90`) with roster-aware filtering.
+5. Loading a pre-trained artifact and producing matchup-specific player projections (`q10`, `q50`, `q90`) with roster-aware filtering.
 
 ## Overview
 
@@ -17,12 +17,11 @@ Sports betting and prop modeling benefit from uncertainty-aware forecasts. Inste
 2. `q50`: median outcome.
 3. `q90`: ceiling outcome.
 
-The app is designed for experimentation and learning:
-1. Select a historical year window.
-2. Train using a date split slider.
-3. Inspect test-set diagnostics.
-4. Choose a matchup and playoff flag.
-5. View roster previews and quantile projections for both teams.
+The app is designed to be easy for non-ML users:
+1. Auto-load processed data from 2020 to present.
+2. Auto-load a pre-trained model artifact.
+3. Choose a matchup and playoff flag.
+4. View roster previews and quantile projections for both teams.
 
 ## Educational Goals
 
@@ -150,24 +149,29 @@ Roster logic:
 
 ## Streamlit App Workflow (`app.py`)
 
-The app follows a two-stage process.
+The app now follows an automated setup workflow.
 
-### Stage 1: Train
-1. Choose data year bounds.
-2. Load and cache data.
-3. Set train split percentage and model parameters.
-4. Train model.
-5. Review diagnostics:
-	1. MAE (q50), RMSE (q50), R2 (q50).
-	2. Interval width and coverage for q10-q90.
-	3. Quantile-level pinball metrics.
+### Startup (Automatic)
+1. Fetch and cache processed NBA data from `2020` to the current season.
+2. Load pre-trained model artifacts from `models/player_prop_artifacts.pt`.
+3. Compute and render test diagnostics (calibration, outlier behavior, and data-volume comparisons).
+4. Show artifact metadata (split date and train/test rows).
 
-### Stage 2: Predict Matchup
+### Predict Matchup
 1. Select home and away teams by name.
 2. Toggle playoffs flag.
 3. Review **official roster preview** for both teams.
 4. Calculate predictions.
 5. View player-level quantile tables for each team.
+
+### Evaluation Diagnostics (Automatic)
+The app now includes startup-computed evaluation components on the held-out test split:
+1. Headline metrics: `MAE`, `RMSE`, `R2` for `q50`.
+2. Per-quantile error table: `q10`, `q50`, `q90` for `MAE`, `RMSE`, `R2`.
+3. Empirical calibration plot: nominal quantile vs empirical coverage.
+4. Outlier summary: robust IQR-based outlier flags on `q50` residuals.
+5. Data-volume analysis: interval width (`q90-q10`) vs total games per player in the full dataset.
+6. Bucketed performance table for player history volume groups (`1-25`, `26-100`, `101+` total games).
 
 State behavior:
 1. Predictions are reset when matchup inputs change to avoid stale outputs.
@@ -214,19 +218,39 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Train/Refresh Model Artifact (Maintainer Workflow)
+
+The user-facing app does not train models. Maintainers refresh artifacts offline and save them to disk.
+
+Default behavior:
+1. Data window starts at `2020`.
+2. End year is rolling and includes the current season.
+3. Split date is fixed at `2024-06-18`.
+
+```bash
+python scripts/train_artifact.py
+```
+
+Optional overrides:
+
+```bash
+python scripts/train_artifact.py --start-year 2020 --end-year 2026 --split-date 2024-06-18 --output models/player_prop_artifacts.pt
+```
+
 ## Programmatic Usage (Optional)
 
-### Train Model
+### Train and Save Artifact
 
 ```python
 from src.data import get_nba_data
 from src.service import train_model, evaluate_test_set
+import torch
 
-train_df, current_players, current_teams = get_nba_data(start_year=2018, end_year=2026)
+train_df, current_players, current_teams = get_nba_data(start_year=2020, end_year=2026)
 
 artifacts = train_model(
 	 df=train_df,
-	 split_date="2024-01-15",
+	 split_date="2024-06-18",
 	 max_epochs=200,
 	 early_stopping_patience=12,
 	 batch_size=256,
@@ -235,6 +259,7 @@ artifacts = train_model(
 
 test_eval = evaluate_test_set(df=train_df, artifacts=artifacts)
 print(test_eval.summary)
+torch.save(artifacts, "models/player_prop_artifacts.pt")
 ```
 
 ### Predict Matchup
