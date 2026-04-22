@@ -1,195 +1,113 @@
-# NBA Player Prop Forecasting App
+# NBA Prop Forecasting App
 
-This repository contains a production-style Streamlit app for NBA player points prop forecasting.
-It predicts uncertainty-aware outcomes with a transformer quantile model and includes a betting-lines workflow with automatic result grading.
+Streamlit app for NBA player points prop forecasting using a transformer quantile model.
 
-## Current Project State
+## What This Repo Does
 
-### What is implemented now
-1. Transformer-only modeling pipeline for player points (`PTS`) quantile regression.
-2. Quantile outputs from the loaded artifact (default artifact is configured for `q10`, `q50`, `q90`).
-3. Auto data loading from 2020 through the current season window.
-4. Fixed train/test split date at `2024-06-18` for artifact consistency.
-5. Three app pages:
-1. `Predict Matchup`
-2. `Betting Lines`
-3. `Test Stats`
-6. Betting page grades picks using completed game stats fetched automatically from `nba_api`.
+- Loads multi-season NBA data from `nba_api`.
+- Uses a pretrained transformer artifact to produce player-level quantile forecasts.
+- Pulls live FanDuel player points lines via The Odds API event endpoints.
+- Builds a live pick board by joining live lines with model projections.
+- Shows historical backtest evaluation charts from a CSV.
 
-### What is no longer the current setup
-1. Legacy rolling-feature-only schema.
-2. Legacy MLP-only model path.
-3. Manual CSV updates for completed actual points (now automatic via API lookup, with optional manual fallback fields).
+## Project Structure
 
-## Architecture
+- `app.py`: Streamlit UI and app workflow.
+- `src/data.py`: historical data fetch + feature engineering.
+- `src/model.py`: transformer model and quantile loss.
+- `src/service.py`: training/inference/evaluation services.
+- `src/fanduel_live.py`: live FanDuel prop loader and local cache.
+- `scripts/train_artifact.py`: artifact training entrypoint.
+- `scripts/backtest_odds.py`: odds backtest utility.
+- `models/`: trained model artifacts.
+- `betting data/`: historical backtest inputs and related data.
 
-### Data layer (`src/data.py`)
-1. Pulls multi-season player and team game logs from `nba_api` (`LeagueGameLog`).
-2. Builds leakage-safe player rows with context features.
-3. Adds opponent last-game context features for inference and training.
-4. Returns:
-1. `final_df` for training/evaluation.
-2. `current_players` for live matchup inference.
-3. `current_teams` for team metadata and opponent context.
+## Core Modeling Setup
 
-### Model layer (`src/model.py`)
-1. `PlayerPropTransformer`: sequence model over per-player game history.
-2. `PinballLoss`: multi-quantile loss function.
-3. Default quantiles in code: `(0.10, 0.50, 0.90)`.
+- Target: player `PTS`.
+- Sequence length: 20 time steps.
+- Active feature set in the default artifact: 28 features.
+- Typical quantiles: `q10`, `q50`, `q90`.
 
-### Service layer (`src/service.py`)
-1. `train_model(...)`: trains transformer artifacts with temporal validation and early stopping.
-2. `predict_matchup(...)`: predicts home/away player quantiles for selected matchup.
-3. `get_matchup_rosters(...)`: resolves official roster previews.
-4. `evaluate_test_set(...)`: computes test diagnostics and calibration-oriented metrics.
-5. `model_summary(...)`: artifact metadata for app display.
+### Input Shape
 
-## Active Feature Schema
+The model processes a tensor shaped like:
 
-The app is currently wired to artifact `models/player_prop_artifacts_opp28.pt` and uses the opponent-context sequence setup.
-
-Target:
-1. `PTS`
-
-Feature groups used for training/inference:
-1. Context (3):
-1. `is_playoff`
-2. `home`
-3. `days_of_rest`
-2. Raw player sequence features (16):
-1. `MIN`
-2. `FGM`
-3. `FGA`
-4. `FG3M`
-5. `FG3A`
-6. `FTM`
-7. `FTA`
-8. `AST`
-9. `REB`
-10. `OREB`
-11. `DREB`
-12. `TOV`
-13. `STL`
-14. `BLK`
-15. `PF`
-16. `PLUS_MINUS`
-3. Opponent last-game context features (9):
-1. `Opp_LastGame_PTS`
-2. `Opp_LastGame_AST`
-3. `Opp_LastGame_REB`
-4. `Opp_LastGame_FGA`
-5. `Opp_LastGame_FG3A`
-6. `Opp_LastGame_TOV`
-7. `Opp_LastGame_STL`
-8. `Opp_LastGame_BLK`
-9. `Opp_LastGame_PLUS_MINUS`
-
-Total active features: 28.
+- `batch_size x sequence_length x feature_count`
+- For the default artifact this is approximately `N x 20 x 28`.
 
 ## App Pages
 
-### 1) Predict Matchup
-1. Select home/away teams and playoff toggle.
-2. Preview official rosters for each team.
-3. Run model inference for both rosters.
-4. View full team forecasts side by side (not truncated to top-N).
+### Predict Matchup
 
-### 2) Betting Lines
-1. Reads `prize_picks_lines.csv` (required columns: `game_date`, `player_name`, `team`, `opponent`, `line`).
-2. Builds model recommendations (`over`, `under`, `push`) from `q50` vs line.
-3. Fetches completed game `PTS` automatically from `nba_api` (`LeagueGameFinder`) by date range.
-4. Scores picks as `correct`, `incorrect`, `pending`, or `push`.
-5. Displays:
-1. Pick cards ordered by biggest edge.
-2. Interval on cards using available quantile bounds.
-3. Edge and status charts.
-4. Cumulative accuracy chart.
-5. Detailed table in an expander.
+- Select home and away teams.
+- Generate roster-level forecasts from the loaded artifact.
+- View player quantiles for both teams.
 
-Notes:
-1. If API data is not available yet for a game, status remains `pending`.
-2. Optional CSV columns `actual_points` or `actual` can still serve as fallback values.
+### Betting Lines
 
-### 3) Test Stats
-1. Artifact metadata and split details.
-2. Headline error metrics on test rows.
-3. Calibration and interval diagnostics.
-4. Player-volume and outlier analyses.
+- Uses startup snapshot of live FanDuel lines.
+- Matches players to home/away team predictions.
+- Builds recommendation cards and a detailed table.
+- Includes historical backtest charts under the live section.
 
-## Caching and Performance
+### Test Stats
+
+- Displays artifact metadata.
+- Shows model diagnostics and calibration-style charts.
+
+## Live Odds Source
+
+Live props are fetched from The Odds API using:
+
+- `GET /v4/sports/basketball_nba/events`
+- `GET /v4/sports/basketball_nba/events/{event_id}/odds`
+
+The loader filters for:
+
+- bookmaker: `fanduel`
+- market: `player_points`
+
+Environment variable required:
+
+- `ODDS_API_KEY` (or `THE_ODDS_API_KEY`)
+
+## Caching
 
 The app uses multiple cache layers:
-1. Dataset cache (`st.cache_data`) for historical pulls and processed frames.
-2. Artifact cache (`st.cache_resource`) for loaded model artifacts.
-3. Betting prediction cache in session state to avoid recomputing repeated slate matchups.
-4. Cached completed-game stat pulls for date ranges.
 
-This means first load is the slowest; subsequent reruns are substantially faster.
+- Streamlit data/resource caching for datasets and artifacts.
+- Local disk cache for live odds in `.cache/live_odds` with TTL and stale fallback.
+- Session-state startup snapshot for live lines to reduce repeated API calls on reruns.
 
 ## Setup
 
-### Prerequisites
-1. Python 3.10+
-2. Internet access for NBA API calls
+1. Create and activate a virtual environment.
+2. Install dependencies.
+3. Set odds API key.
+4. Run Streamlit.
 
-### Install
+Example:
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+- `python3 -m venv venv`
+- `source venv/bin/activate`
+- `pip install -r requirements.txt`
+- `export ODDS_API_KEY=your_key_here`
+- `streamlit run app.py`
 
-### Run
+## Training / Refreshing Artifacts
 
-```bash
-streamlit run app.py
-```
+To train a new artifact:
 
-## Train or Refresh Artifact
+- `python scripts/train_artifact.py`
 
-Use:
+Artifacts are loaded from `models/` and configured in `app.py`.
 
-```bash
-python scripts/train_artifact.py
-```
+## Notes
 
-Current defaults in `scripts/train_artifact.py`:
-1. `--start-year 2020`
-2. `--end-year` rolls with current season
-3. `--split-date 2024-06-18`
-4. `--output models/player_prop_artifacts_opp28.pt`
-5. `--sequence-length 20`
-
-Example override:
-
-```bash
-python scripts/train_artifact.py --start-year 2020 --end-year 2026 --split-date 2024-06-18 --output models/player_prop_artifacts_opp28.pt --sequence-length 20
-```
-
-## Repository Layout
-
-```text
-NBA-Prop-Forecasting-App/
-|- app.py
-|- prize_picks_lines.csv
-|- requirements.txt
-|- scripts/
-|  |- train_artifact.py
-|- src/
-|  |- data.py
-|  |- model.py
-|  |- service.py
-|- models/
-|  |- player_prop_artifacts_opp28.pt   # expected at runtime
-```
-
-## Known Limitations
-
-1. Name matching between CSV lines and NBA API box scores is normalization-based and can still miss rare aliases.
-2. Team/opponent abbreviations in CSV must map to NBA abbreviations present in `current_teams`.
-3. NBA API latency/rate limits can delay updates or produce temporary fetch failures.
-4. Model quality depends on artifact freshness and selected feature schema.
+- Live game times are displayed in UTC in the pick board.
+- If a live player cannot be matched to either roster, the row remains unassigned and drops from projected output.
+- Historical charts rely on `betting data/backtests/partner_odds_backtest.csv`.
 
 ## License
 

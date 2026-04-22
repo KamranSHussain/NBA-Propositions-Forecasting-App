@@ -11,6 +11,9 @@ numpy
 # Machine Learning
 torch
 
-# Visualization (Optional, but great for Streamlit)
+# Visualization
 plotly
 matplotlib
+
+# HTTP
+requests
