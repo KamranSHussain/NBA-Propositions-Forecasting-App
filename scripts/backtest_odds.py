@@ -25,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data import get_nba_data
 from src.service import evaluate_test_set
 
+RECOMMENDER_MIN_DECIMAL_ODDS = 1.81
+
 
 def _rolling_end_year_exclusive(today: pd.Timestamp | None = None) -> int:
     """Return end_year (exclusive) so current season is included automatically."""
@@ -319,8 +321,47 @@ def run_backtest(
     merged.loc[merged["actual_side"] == "push", "status"] = "push"
     merged["edge"] = merged["q50"] - merged["line"]
 
+    # Current app rule: under only when the line sits closer to q90 than q50,
+    # with an odds floor on the under side.
+    merged["selection_distance"] = (merged["line"] - merged["q50"]).abs()
+    merged["tail_distance"] = (merged["q90"] - merged["line"]).abs()
+    merged["selection_ratio"] = np.nan
+    valid_ratio = merged["tail_distance"] > 0
+    merged.loc[valid_ratio, "selection_ratio"] = (
+        merged.loc[valid_ratio, "selection_distance"] / merged.loc[valid_ratio, "tail_distance"]
+    )
+    merged.loc[
+        (merged["tail_distance"] == 0) & merged["selection_distance"].notna(),
+        "selection_ratio",
+    ] = float("inf")
+
+    merged["selection_side"] = pd.NA
+    under_candidate = (
+        merged["line"].gt(merged["q50"])
+        & merged["selection_distance"].ge(merged["tail_distance"])
+    )
+    merged.loc[under_candidate, "selection_side"] = "under"
+
+    merged["pick_odds"] = pd.NA
+    merged.loc[merged["selection_side"].eq("under"), "pick_odds"] = merged.loc[
+        merged["selection_side"].eq("under"),
+        "under_odds",
+    ]
+    merged["recommender_pick"] = (
+        merged["selection_side"].eq("under")
+        & pd.to_numeric(merged["pick_odds"], errors="coerce").ge(RECOMMENDER_MIN_DECIMAL_ODDS)
+    )
+    merged["current_rule_correct"] = pd.NA
+    graded_rule = merged["recommender_pick"] & merged["actual_side"].isin(["under", "over"])
+    merged.loc[graded_rule, "current_rule_correct"] = (
+        merged.loc[graded_rule, "selection_side"] == merged.loc[graded_rule, "actual_side"]
+    )
+
     graded = merged[merged["status"].isin(["correct", "incorrect"])].copy()
     accuracy = float((graded["status"] == "correct").mean()) if len(graded) else float("nan")
+    current_rule_rows = int(merged["recommender_pick"].sum())
+    current_rule_graded = merged[merged["recommender_pick"] & merged["actual_side"].isin(["under", "over"])].copy()
+    current_rule_accuracy = float(current_rule_graded["current_rule_correct"].mean()) if len(current_rule_graded) else float("nan")
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(output_csv, index=False)
@@ -335,6 +376,8 @@ def run_backtest(
         "correct": int((merged["status"] == "correct").sum()),
         "incorrect": int((merged["status"] == "incorrect").sum()),
         "push": int((merged["status"] == "push").sum()),
+        "current_rule_rows": current_rule_rows,
+        "current_rule_accuracy_pct": float(round(current_rule_accuracy * 100, 2)) if np.isfinite(current_rule_accuracy) else float("nan"),
         "game_id_match_rate_pct": 100.0,
         "max_abs_date_delta_days": int(merged["date_delta_days"].abs().max()),
         "min_game_date": str(pd.to_datetime(merged["GAME_DATE"]).min().date()),

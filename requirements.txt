@@ -1,19 +1,18 @@
 # Web App
-streamlit
+streamlit==1.55.0
 
 # NBA Data
-nba_api
+nba_api==1.11.4
 
 # Data Manipulation
-pandas
-numpy
+pandas==2.3.3
+numpy==2.2.6
 
 # Machine Learning
-torch
+torch==2.11.0
 
 # Visualization
-plotly
-matplotlib
+plotly==6.6.0
 
 # HTTP
-requests
+requests==2.33.0

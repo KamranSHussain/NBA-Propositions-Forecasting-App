@@ -125,19 +125,6 @@ def _split_train_test(df: pd.DataFrame, split_date: pd.Timestamp) -> tuple[pd.Da
     return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
-def _standardize_train_test(
-    train_x: pd.DataFrame,
-    test_x: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    """Apply train-fit z-score scaling and return transformed frames + stats."""
-    mean = train_x.mean(axis=0)
-    std = train_x.std(axis=0).replace(0, 1.0)
-
-    train_scaled = (train_x - mean) / std
-    test_scaled = (test_x - mean) / std
-    return train_scaled, test_scaled, mean, std
-
-
 def _to_tensor(values: np.ndarray) -> torch.Tensor:
     """Convert numpy arrays to float32 torch tensors."""
     return torch.tensor(values.astype(np.float32), dtype=torch.float32)
@@ -196,26 +183,6 @@ def _build_history_tensors(
         start_idx = end_idx
 
     return ordered, seq, pad_mask, targets
-
-
-def _split_train_validation(
-    train_df: pd.DataFrame,
-    val_fraction: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create temporal train/validation subsets for early stopping."""
-    if not 0.0 < val_fraction < 0.5:
-        raise ValueError("val_fraction must be between 0 and 0.5.")
-
-    ordered = train_df.sort_values("GAME_DATE").reset_index(drop=True)
-    val_size = max(1, int(len(ordered) * val_fraction))
-    split_idx = len(ordered) - val_size
-
-    if split_idx < 1:
-        raise ValueError("Not enough train rows for validation split. Increase date range.")
-
-    fit_df = ordered.iloc[:split_idx].copy()
-    val_df = ordered.iloc[split_idx:].copy()
-    return fit_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
 def train_model(
@@ -740,6 +707,12 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
     total_games_by_player = (
         full_df.groupby("PLAYER_ID")["GAME_ID"].nunique().astype(float)
     )
+    mean_minutes_by_player = (
+        pd.to_numeric(full_df.get("MIN"), errors="coerce")
+        .groupby(full_df["PLAYER_ID"])
+        .mean()
+        .astype(float)
+    )
 
     test_df, preds = _predict_test_set_with_transformer(df=df, artifacts=artifacts)
     y_true = test_df[TARGET_COLUMN].to_numpy(dtype=float)
@@ -815,6 +788,9 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
     predictions["total_games_in_dataset"] = (
         predictions["PLAYER_ID"].map(total_games_by_player).fillna(0).astype(float)
     )
+    predictions["mean_minutes_in_dataset"] = (
+        predictions["PLAYER_ID"].map(mean_minutes_by_player).fillna(0).astype(float)
+    )
 
     # IQR-based residual outlier detection is robust to skewed error distributions.
     residual_q1 = float(predictions["residual_q50"].quantile(0.25))
@@ -854,6 +830,7 @@ def evaluate_test_set(df: pd.DataFrame, artifacts: ModelArtifacts) -> TestSetEva
         predictions.groupby(["PLAYER_ID", "PLAYER_NAME"], as_index=False)
         .agg(
             total_games_in_dataset=("total_games_in_dataset", "max"),
+            mean_minutes_in_dataset=("mean_minutes_in_dataset", "max"),
             test_rows=("PLAYER_ID", "size"),
             mean_interval_width_q10_q90=("interval_width_q10_q90", "mean"),
             mean_abs_error_q50=("abs_error_q50", "mean"),
