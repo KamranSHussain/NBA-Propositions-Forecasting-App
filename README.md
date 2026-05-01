@@ -69,7 +69,7 @@ The forecasting model is a **transformer encoder** over fixed-length historical 
 
 Important choices:
 
-- **Sequence length**: 20 historical timesteps
+- **Sequence length**: 20 historical timesteps (greater timesteps didn't produce better results in testing)
 - **Loss**: multi-quantile pinball loss
 - **Context features**: home/away flag, playoff flag, days of rest, recent player box score features, opponent last-game team context
 - **Cold-start handling**: learned fallback token for short-history players
